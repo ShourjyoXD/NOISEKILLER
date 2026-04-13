@@ -1,51 +1,51 @@
-import uuid
 import re
-from typing import Optional
+import uuid
+import asyncio
+from google import genai
+from app.config import settings 
+from app.constants.prompts import GENERATOR_SYSTEM_PROMPT
 from app.models.schema import AgentInternalResult
+from app.utils.logger import logger
+from app.utils.exceptions import AgentFailure
 
 class CodeGenerator:
-    def __init__(self, model_name: str = "Gemini 2.5 Flash"):
-        self.model_name = model_name
-
-    async def generate(self, query: str, context: Optional[str] = None) -> AgentInternalResult:
+    def __init__(self):
         """
-        Generates a structured response by prompting the LLM to separate 
-        the answer from the reasoning.
+        Initializes the Gemini 2.5 Flash Client using the 
+        validated key from our global settings object.
         """
+        self.client = genai.Client(api_key=settings.gemini_api_key)
+        self.model_id = "gemini-2.5-flash"
+
+    async def generate(self, query: str, context: str = None) -> AgentInternalResult:
+        # 1. Format the professional prompt
+        prompt = GENERATOR_SYSTEM_PROMPT.format(context_data=context or "No context provided.")
         
-        # 1. System Prompt Engineering
-        # We define a 'Contract' with the AI to ensure parsable output.
-        system_instructions = (
-            f"You are the Generator Agent for TrustLayer AI. "
-            f"Use the following context if provided: {context if context else 'No context provided.'}\n"
-            f"Provide your response in the following strict format:\n"
-            f"[[ANSWER]]: <your final answer>\n"
-            f"[[REASONING]]: <step-by-step logic, comma-separated>"
-        )
+        try:
+            # 2. Run the Gemini call in a separate thread to keep FastAPI async
+            response = await asyncio.to_thread(
+                self.client.models.generate_content,
+                model=self.model_id,
+                contents=f"{prompt}\n\nUser Query: {query}"
+            )
+            
+            if not response or not response.text:
+                raise AgentFailure("Gemini 2.5 Flash returned an empty response.")
 
-        # 2. Simulated LLM Call 
-        simulated_llm_raw_output = (
-            f"[[ANSWER]]: Based on the query '{query}', the result is optimal. "
-            f"[[REASONING]]: Identified user intent, cross-referenced context, verified logic"
-        )
+            raw_text = response.text
 
-        # 3. Robust Parsing (Using Regex instead of .split)
-        # This is more space-efficient and less prone to character collisions
-        answer_match = re.search(r"\[\[ANSWER\]\]:\s*(.*?)(?=\[\[|$)", simulated_llm_raw_output, re.DOTALL)
-        reasoning_match = re.search(r"\[\[REASONING\]\]:\s*(.*)", simulated_llm_raw_output, re.DOTALL)
+            # 3. Robust Extraction (Regex)
+            answer_match = re.search(r"\[\[ANSWER\]\]:\s*(.*?)(?=\[\[|$)", raw_text, re.DOTALL)
+            reasoning_match = re.search(r"\[\[REASONING\]\]:\s*(.*)", raw_text, re.DOTALL)
 
-        raw_answer = answer_match.group(1).strip() if answer_match else "Error: Could not parse answer."
-        
-        # Handle the reasoning steps as a list
-        if reasoning_match:
-            reasoning_steps = [step.strip() for step in reasoning_match.group(1).split(",") if step.strip()]
-        else:
-            reasoning_steps = ["No explicit reasoning provided by model."]
+            # 4. Final Packaging
+            return AgentInternalResult(
+                generation_id=str(uuid.uuid4()),
+                raw_answer=answer_match.group(1).strip() if answer_match else raw_text.strip(),
+                reasoning_steps=[s.strip() for s in reasoning_match.group(1).split(",") if s.strip()] if reasoning_match else ["No reasoning provided."],
+                suggested_sources=["Gemini 2.5 Flash Internal Knowledge"]
+            )
 
-        # 4. Return the standard internal contract
-        return AgentInternalResult(
-            generation_id=str(uuid.uuid4()),
-            raw_answer=raw_answer,
-            reasoning_steps=reasoning_steps,
-            suggested_sources=["Internal Knowledge"] if not context else ["Provided Context"]
-        )
+        except Exception as e:
+            logger.error(f"Gemini API Error: {str(e)}")
+            raise AgentFailure(f"AI Generation Failed: {str(e)}")
